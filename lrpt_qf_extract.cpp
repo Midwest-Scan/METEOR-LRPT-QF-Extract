@@ -23,6 +23,7 @@ static constexpr size_t OFF_CODING = OFF_PRIMARY + 6;
 static constexpr size_t OFF_ACCESS = OFF_CODING + 2;
 static constexpr size_t OFF_ZONE = OFF_ACCESS + 2;
 static constexpr size_t ZONE_LEN = 882;
+static constexpr uint8_t TARGET_VCID = 5;
 
 // Segment-span guard
 static constexpr uint32_t SEG_CNT = 20000;
@@ -449,6 +450,11 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
 
         // ASM check
         if (be32(frame.data()) != ASM) continue;
+
+        // VCID gate (only demux VCID 5)
+        const uint16_t tf0 = be16(frame.data() + OFF_PRIMARY);
+        const uint8_t vcid = uint8_t(tf0 & 0x3F);
+        if (vcid != TARGET_VCID) continue;
 
         // Access header
         const uint16_t acc = be16(frame.data() + OFF_ACCESS);
