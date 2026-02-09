@@ -7,7 +7,6 @@
 #include <set>
 #include <filesystem>
 #include <algorithm>
-#include <sstream>
 #include <iomanip>
 #include <stdexcept>
 
@@ -66,28 +65,33 @@ static inline uint32_t be32(const uint8_t* p) {
     return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
 }
 
-// Fixed-range scaling for composite: preserve 0 as "missing"
-// Map QF 20..100 -> 1..255
-static inline uint8_t scale_qf_20_100_to_1_255(uint8_t qf) {
-    if (qf == 0) return 0; // missing
-
-    constexpr int QF_MIN = 20;
-    constexpr int QF_MAX = 100;
-    constexpr int SPAN = (QF_MAX - QF_MIN); // 80
+static inline void qf_to_heat_rgb(uint8_t qf, uint8_t& r, uint8_t& g, uint8_t& b)
+{
+    if (qf == 0) { // missing segment
+        r = g = b = 0;
+        return;
+    }
 
     int v = int(qf);
-    if (v < QF_MIN) v = QF_MIN;
-    if (v > QF_MAX) v = QF_MAX;
+    if (v < 20) v = 20;
+    if (v > 100) v = 100;
 
-    int x = v - QF_MIN; // 0..80
-
-    // Map 0..80 -> 1..255 using rounding:
-    // scaled = 1 + round(x * 254 / 80)
-    int scaled = 1 + (x * 254 + (SPAN / 2)) / SPAN;
-
-    if (scaled < 1) scaled = 1;
-    if (scaled > 255) scaled = 255;
-    return uint8_t(scaled);
+    if (v <= 60) {
+        // Red -> yellow: add green
+        const int t = v - 20; // 0..40
+        const int g_i = (t * 255 + 20) / 40; // rounded integer division by 40
+        r = 255;
+        g = uint8_t(g_i);
+        b = 0;
+    }
+    else {
+        // Yellow -> green: drop red
+        const int t = v - 60; // 0..40
+        const int r_i = (255 - (t * 255 + 20) / 40);
+        r = uint8_t(r_i);
+        g = 255;
+        b = 0;
+    }
 }
 
 // Minimal baseline TIFF writer (8-bit grayscale, uncompressed, single strip)
@@ -131,16 +135,16 @@ static bool write_tiff_gray8(const std::filesystem::path& out_path, uint32_t wid
     // IFD entries
     std::vector<TiffIFDEntry> entries;
     entries.reserve(10);
-    entries.push_back({ 256, 4, 1, width });              // ImageWidth
-    entries.push_back({ 257, 4, 1, height });             // ImageLength
-    entries.push_back({ 258, 3, 1, 8 });                  // BitsPerSample
-    entries.push_back({ 259, 3, 1, 1 });                  // Compression = none
-    entries.push_back({ 262, 3, 1, 1 });                  // Photometric = BlackIsZero
-    entries.push_back({ 273, 4, 1, strip_offset });       // StripOffsets
-    entries.push_back({ 277, 3, 1, 1 });                  // SamplesPerPixel
-    entries.push_back({ 278, 4, 1, height });             // RowsPerStrip
-    entries.push_back({ 279, 4, 1, strip_byte_count });   // StripByteCounts
-    entries.push_back({ 284, 3, 1, 1 });                  // PlanarConfiguration = chunky
+    entries.push_back({ 256, 4, 1, width });            // ImageWidth
+    entries.push_back({ 257, 4, 1, height });           // ImageLength
+    entries.push_back({ 258, 3, 1, 8 });                // BitsPerSample
+    entries.push_back({ 259, 3, 1, 1 });                // Compression = none
+    entries.push_back({ 262, 3, 1, 1 });                // Photometric = BlackIsZero
+    entries.push_back({ 273, 4, 1, strip_offset });     // StripOffsets
+    entries.push_back({ 277, 3, 1, 1 });                // SamplesPerPixel
+    entries.push_back({ 278, 4, 1, height });           // RowsPerStrip
+    entries.push_back({ 279, 4, 1, strip_byte_count }); // StripByteCounts
+    entries.push_back({ 284, 3, 1, 1 });                // PlanarConfiguration = chunky
 
     write_u16(out, uint16_t(entries.size()));
     for (const auto& e : entries) {
@@ -233,6 +237,10 @@ struct MSUMRQFReconstructor {
         const uint16_t w0 = be16(pkt.data());
         const bool shf = (((w0 >> 11) & 1) != 0);
         const uint16_t apid = (w0 & 0x07FF);
+
+        const uint8_t ver = uint8_t((w0 >> 13) & 0x7);
+        const uint8_t typ = uint8_t((w0 >> 12) & 0x1);
+        if (ver != 0 || typ != 0) return; // only telemetry, version 0
 
         const int ch = apid_to_channel(apid);
         if (ch < 0) return;
@@ -342,8 +350,7 @@ struct MSUMRQFReconstructor {
         lastSeg_line += 14u;
 
         // If current channel has no data
-        if (firstSeg[channel] == 0xFFFFFFFFu) firstSeg_line = 0u;
-        if (lastSeg[channel] == 0u) lastSeg_line = 0u;
+        if (firstSeg[channel] == 0xFFFFFFFFu) return { 0u, 0u };
 
         // Align to boundaries
         if (firstSeg_line != 0u) firstSeg_line = floor14(firstSeg_line);
@@ -409,29 +416,10 @@ struct MSUMRQFReconstructor {
 };
 
 // CADU -> CCSDS reassembly
-static void try_process_carry(MSUMRQFReconstructor& recon, std::vector<uint8_t>& carry, bool discarding)
+static void process_carry_for_qf(MSUMRQFReconstructor& recon, const std::vector<uint8_t>& carry)
 {
-    if (carry.size() < 6) return;
-
-    const uint16_t w2 = be16(carry.data() + 4);
-    const uint32_t expected_total = 6u + (uint32_t(w2) + 1u);
-
-    const bool enough_for_qf = (carry.size() >= 6u + MIN_PAYLOAD_FOR_QF);
-
-    if (expected_total < 6u || expected_total > MAX_PACKET_BYTES) {
-        if (discarding && enough_for_qf) recon.ingest_packet_partial_ok(carry);
-        return;
-    }
-
-    if (carry.size() == expected_total) {
+    if (carry.size() >= 6u + MIN_PAYLOAD_FOR_QF)
         recon.ingest_packet_partial_ok(carry);
-        return;
-    }
-
-    if (discarding && enough_for_qf) {
-        recon.ingest_packet_partial_ok(carry);
-        return;
-    }
 }
 
 static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFReconstructor& recon)
@@ -460,11 +448,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
         const uint16_t acc = be16(frame.data() + OFF_ACCESS);
         const uint16_t marker5 = (acc >> 11) & 0x1F;
         uint16_t fhp = acc & 0x7FF;
-        bool header_present = (marker5 == 0);
-
-        // Defensive FHP clamp
-        if (fhp > ZONE_LEN) header_present = false;
-
+        const bool header_present = (marker5 == 0) && (fhp < ZONE_LEN); // defensive FHP clamp
         const uint8_t* zone = frame.data() + OFF_ZONE;
 
         // Append continuation bytes
@@ -481,7 +465,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
 
         // Carry hard cap
         if (carry.size() > MAX_CARRY_BYTES) {
-            try_process_carry(recon, carry, true);
+            process_carry_for_qf(recon, carry);
             carry.clear();
         }
 
@@ -491,7 +475,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
                 const uint16_t w2 = be16(carry.data() + 4);
                 const uint32_t expected_total = 6u + (uint32_t(w2) + 1u);
                 if (carry.size() != expected_total) {
-                    try_process_carry(recon, carry, true);
+                    process_carry_for_qf(recon, carry);
                     carry.clear();
                 }
             }
@@ -503,7 +487,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
             const uint32_t expected_total = 6u + (uint32_t(w2) + 1u);
 
             if (expected_total < 6u || expected_total > MAX_PACKET_BYTES) {
-                try_process_carry(recon, carry, true);
+                process_carry_for_qf(recon, carry);
                 carry.clear();
             }
             else if (carry.size() == expected_total) {
@@ -511,7 +495,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
                 carry.clear();
             }
             else if (carry.size() > expected_total) {
-                try_process_carry(recon, carry, true);
+                process_carry_for_qf(recon, carry);
                 carry.clear();
             }
         }
@@ -523,7 +507,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
                 // Straddling header
                 carry.insert(carry.end(), zone + off, zone + ZONE_LEN);
                 if (carry.size() > MAX_CARRY_BYTES) {
-                    try_process_carry(recon, carry, true);
+                    process_carry_for_qf(recon, carry);
                     carry.clear();
                 }
                 break;
@@ -555,7 +539,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
 
             // Continues into next frame
             if (carry.size() > MAX_CARRY_BYTES) {
-                try_process_carry(recon, carry, true);
+                process_carry_for_qf(recon, carry);
                 carry.clear();
             }
             break;
@@ -564,7 +548,7 @@ static void extract_from_cadu(const std::filesystem::path& cadu_path, MSUMRQFRec
 
     // EOF: accept partial if enough
     if (!carry.empty()) {
-        try_process_carry(recon, carry, true);
+        process_carry_for_qf(recon, carry);
         carry.clear();
     }
 }
@@ -595,75 +579,89 @@ static bool write_quality_json(const std::filesystem::path& out_path, const std:
     return bool(out);
 }
 
-// Composite generator: 3 smallest APIDs -> RGB, expanded to 1568 x (rows*8)
-// Scaling: QF 20..100 -> 1..255, missing stays 0.
-static bool build_rgb_composite_from_segments(const MSUMRQFReconstructor& recon, const std::array<int, 3>& chs, const std::array<uint16_t, 3>& apids, std::vector<uint8_t>& out_rgb, int& out_w, int& out_h, std::string& out_digits)
+struct QFGrid14 {
+    uint16_t apid = 0;
+    int ch = -1;            // 0..5
+    uint32_t rows = 0;      // N
+    std::vector<uint8_t> v; // size = 14*rows, row-major
+};
+
+static bool build_qf_grid14(const MSUMRQFReconstructor& recon, int ch, uint16_t apid, QFGrid14& out)
 {
-    // Use union bounds across the three channels, so composite covers everything received.
-    uint32_t min_first = 0xFFFFFFFFu;
-    uint32_t max_last = 0u;
+    out = {};
+    out.apid = apid;
+    out.ch = ch;
 
-    for (int k = 0; k < 3; k++) {
-        const int ch = chs[k];
-        const auto b = recon.compute_bounds(ch);
-        if (b.second == 0u) return false;
-        min_first = std::min(min_first, b.first);
-        max_last = std::max(max_last, b.second);
+    const auto b = recon.compute_bounds(ch);
+    if (b.second == 0u || b.second <= b.first) return false;
+
+    const uint32_t rows = (b.second - b.first) / 14u;
+    if (rows == 0u) return false;
+    if (rows > (MAX_QF_SEGMENTS / 14u)) return false;
+
+    out.rows = rows;
+    out.v.assign(size_t(rows) * 14u, 0u);
+
+    const auto& mp = recon.segQF[ch];
+
+    for (uint32_t r = 0; r < rows; r++) {
+        const uint32_t base_id = b.first + r * 14u;
+        for (uint32_t j = 0; j < 14u; j++) {
+            const uint32_t id = base_id + j;
+            auto it = mp.find(id);
+            out.v[size_t(r) * 14u + j] = (it != mp.end()) ? it->second : 0u;
+        }
     }
-    if (min_first == 0xFFFFFFFFu || max_last == 0u || max_last < min_first) return false;
 
-    const uint32_t seg_rows = (max_last - min_first) / 14u;
-    if (seg_rows == 0u) return false;
+    return true;
+}
 
-    if (seg_rows > (MAX_QF_SEGMENTS / 14u)) return false;
+static bool build_heatmap_avg_from_grids(const std::vector<QFGrid14>& grids, std::vector<uint8_t>& out_rgb, int& out_w, int& out_h, std::string& out_digits)
+{
+    if (grids.empty()) return false;
 
-    // Expanded dimensions: each segment becomes 112x8 block
-    const int width_px = 1568;
-    const int height_px = int(seg_rows * 8u);
+    // Output filename digits
+    out_digits.clear();
+    for (const auto& g : grids)
+        out_digits.push_back(char('0' + apid_to_digit(g.apid)));
+
+    // Height = max rows among selected grids
+    uint32_t rows_max = 0;
+    for (const auto& g : grids)
+        rows_max = std::max(rows_max, g.rows);
+    if (rows_max == 0) return false;
 
     constexpr int seg_w = 112;
     constexpr int seg_h = 8;
-
-    out_w = width_px;
-    out_h = height_px;
+    out_w = 1568;
+    out_h = int(rows_max * 8u);
     out_rgb.assign(size_t(out_w) * size_t(out_h) * 3, 0u);
 
-    // Digits for filename: APID 64->1 ... 69->6
-    out_digits.clear();
-    for (int k = 0; k < 3; k++) {
-        out_digits.push_back(char('0' + apid_to_digit(apids[k])));
-    }
-
-    const auto& mapR = recon.segQF[chs[0]];
-    const auto& mapG = recon.segQF[chs[1]];
-    const auto& mapB = recon.segQF[chs[2]];
-
-    for (uint32_t r = 0; r < seg_rows; r++) {
-        const uint32_t base_id = min_first + r * 14u;
+    for (uint32_t r = 0; r < rows_max; r++) {
+        const int y0 = int(r) * seg_h;
 
         for (uint32_t j = 0; j < 14u; j++) {
-            const uint32_t id = base_id + j;
+            int sum = 0, cnt = 0;
 
-            uint8_t qfr = 0, qfg = 0, qfb = 0;
+            for (const auto& g : grids) {
+                if (r < g.rows) {
+                    const uint8_t q = g.v[size_t(r) * 14u + j];
+                    if (q != 0) { sum += int(q); cnt++; }
+                }
+            }
 
-            auto itR = mapR.find(id); if (itR != mapR.end()) qfr = itR->second;
-            auto itG = mapG.find(id); if (itG != mapG.end()) qfg = itG->second;
-            auto itB = mapB.find(id); if (itB != mapB.end()) qfb = itB->second;
+            uint8_t avg_qf = 0;
+            if (cnt) avg_qf = uint8_t((sum + cnt / 2) / cnt);
 
-            // Apply fixed-range scaling for the composite
-            qfr = scale_qf_20_100_to_1_255(qfr);
-            qfg = scale_qf_20_100_to_1_255(qfg);
-            qfb = scale_qf_20_100_to_1_255(qfb);
+            uint8_t rr, gg, bb;
+            qf_to_heat_rgb(avg_qf, rr, gg, bb);
 
             const int x0 = int(j) * seg_w;
-            const int y0 = int(r) * seg_h;
 
             for (int yy = 0; yy < seg_h; yy++) {
                 uint8_t* rowp = &out_rgb[(size_t(y0 + yy) * size_t(out_w) + size_t(x0)) * 3];
                 for (int xx = 0; xx < seg_w; xx++) {
-                    rowp[0] = qfr;
-                    rowp[1] = qfg;
-                    rowp[2] = qfb;
+                    rowp[0] = rr; rowp[1] = gg; rowp[2] = bb;
                     rowp += 3;
                 }
             }
@@ -749,37 +747,66 @@ int main(int argc, char** argv) {
             std::cout << "Wrote " << json_path.string() << "\n";
         }
 
-        // Composite: pick 3 smallest APIDs present
+        // Heatmap: average QF across available channels (use up to 3 smallest APIDs)
         std::sort(present.begin(), present.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        if (present.size() < 3) {
-            std::cout << "Note: fewer than 3 channels present; skipping RGB composite.\n";
+        if (present.empty()) {
+            std::cout << "Note: no channels present; skipping heatmap.\n";
         }
         else {
-            if (present.size() > 3) std::cout << "Warning: more than 3 channels present (possible channel switch). " << "Using the three smallest APIDs for RGB.\n";
+            const size_t k = std::min<size_t>(3, present.size());
+            if (present.size() > 3)
+                std::cout << "Warning: more than 3 channels present; using the three smallest APIDs for heatmap.\n";
 
-            const std::array<uint16_t, 3> apids = { present[0].first, present[1].first, present[2].first };
-            const std::array<int, 3> chs = { present[0].second, present[1].second, present[2].second };
+            // Build aligned per-channel grids
+            std::vector<QFGrid14> grids;
+            grids.reserve(k);
 
-            std::vector<uint8_t> rgb;
-            int cw = 0, ch = 0;
-            std::string digits;
+            std::vector<uint16_t> used_apids;
+            used_apids.reserve(k);
 
-            if (!build_rgb_composite_from_segments(recon, chs, apids, rgb, cw, ch, digits)) {
-                std::cerr << "Error: failed to build RGB composite buffer.\n";
-                return 1;
+            for (size_t i = 0; i < k; i++) {
+                const uint16_t apid = present[i].first;
+                const int ch = present[i].second;
+
+                QFGrid14 g;
+                if (!build_qf_grid14(recon, ch, apid, g)) {
+                    std::cerr << "Warning: failed to build QF grid for APID " << apid << "\n";
+                    continue;
+                }
+
+                used_apids.push_back(apid);
+                grids.push_back(std::move(g));
             }
 
-            const std::string jpg_name = std::string("msu_mr_rgb_") + digits + "_qf.jpg";
-            const auto jpg_path = quality_dir / jpg_name;
-
-            constexpr int JPG_QUALITY = 90;
-            if (!write_jpeg_rgb_turbo(jpg_path, rgb, cw, ch, JPG_QUALITY)) {
-                std::cerr << "Error: failed to write JPEG (libjpeg-turbo): " << jpg_path.string() << "\n";
-                return 1;
+            if (grids.empty()) {
+                std::cerr << "Error: no valid channel grids; skipping heatmap.\n";
             }
+            else {
+                std::vector<uint8_t> heat_rgb;
+                int hw = 0, hh = 0;
+                std::string digits;
 
-            std::cout << "Wrote " << jpg_path.string() << " : " << cw << "x" << ch << "  (R,G,B APIDs = " << apids[0] << "," << apids[1] << "," << apids[2] << ")" << "  Q=" << JPG_QUALITY << "\n";
+                if (!build_heatmap_avg_from_grids(grids, heat_rgb, hw, hh, digits)) {
+                    std::cerr << "Error: failed to build heatmap buffer.\n";
+                }
+                else {
+                    const auto out_path = quality_dir / (std::string("msu_mr_qf_heatmap_") + digits + ".jpg");
+                    constexpr int JPG_QUALITY = 90;
+
+                    if (!write_jpeg_rgb_turbo(out_path, heat_rgb, hw, hh, JPG_QUALITY)) {
+                        std::cerr << "Error: failed to write heatmap JPEG: " << out_path.string() << "\n";
+                    }
+                    else {
+                        std::cout << "Wrote " << out_path.string() << " : " << hw << "x" << hh << "  (avg over APIDs ";
+                        for (size_t i = 0; i < used_apids.size(); i++) {
+                            if (i) std::cout << ",";
+                            std::cout << used_apids[i];
+                        }
+                        std::cout << ")  Q=" << JPG_QUALITY << "\n";
+                    }
+                }
+            }
         }
 
         if (!recon.apids_seen.empty()) {
